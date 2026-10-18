@@ -2,24 +2,24 @@
 name: Build Vung Facebook AI Auto APK
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
       - master
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-build-${{ github.ref }}
+  group: android-apk-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
@@ -31,57 +31,76 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Detect Android project
+      - name: Find and extract project ZIP
         id: project
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Repository root:"
-          pwd
-          ls -la
+          mkdir -p "$RUNNER_TEMP/vung-source"
 
-          PROJECT_DIR=""
+          ZIP_FILE=""
 
-          # Ưu tiên Gradle Wrapper ở thư mục gốc.
-          if [ -f "./gradlew" ] && \
-             { [ -f "./settings.gradle" ] || [ -f "./settings.gradle.kts" ]; }; then
-            PROJECT_DIR="."
-          elif [ -f "./android/gradlew" ] && \
-               { [ -f "./android/settings.gradle" ] || [ -f "./android/settings.gradle.kts" ]; }; then
-            PROJECT_DIR="./android"
+          if [ -f "Vung-Facebook-AI-Auto-v2.zip" ]; then
+            ZIP_FILE="Vung-Facebook-AI-Auto-v2.zip"
           else
-            # Tìm settings.gradle ở các thư mục con.
-            while IFS= read -r FILE; do
-              DIR="$(dirname "$FILE")"
-              if [ -f "$DIR/gradlew" ]; then
-                PROJECT_DIR="$DIR"
-                break
-              fi
-            done < <(
-              find . -maxdepth 6 -type f \
-                \( -name settings.gradle -o -name settings.gradle.kts \) \
-                -not -path './.git/*' | sort
-            )
+            ZIP_FILE="$(find . -maxdepth 4 -type f \
+              -iname 'Vung-Facebook-AI-Auto-v2.zip' \
+              -not -path './.git/*' | head -n 1 || true)"
           fi
 
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "::error::Không tìm thấy dự án Android có settings.gradle và gradlew."
-            echo "Hãy kiểm tra mã nguồn Android và Gradle Wrapper trong repository."
-            echo "Các file Gradle hiện có:"
-            find . -maxdepth 6 -type f \
-              \( -name settings.gradle -o -name settings.gradle.kts \
-                 -o -name build.gradle -o -name build.gradle.kts \
-                 -o -name gradlew \) \
-              -not -path './.git/*' -print
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::Không tìm thấy Vung-Facebook-AI-Auto-v2.zip."
+            echo "Các file trong repository:"
+            find . -maxdepth 3 -type f | head -200
+            exit 1
+          fi
+
+          echo "Found source archive: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/vung-source"
+
+          SETTINGS_FILE="$(find "$RUNNER_TEMP/vung-source" \
+            -type f \( -name settings.gradle.kts \
+            -o -name settings.gradle \) \
+            | head -n 1 || true)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::ZIP không chứa settings.gradle hoặc settings.gradle.kts."
+            find "$RUNNER_TEMP/vung-source" -maxdepth 5 -type f | head -200
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
+             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
+            echo "::error::Không tìm thấy cấu hình module app trong $PROJECT_DIR."
+            find "$PROJECT_DIR" -maxdepth 4 -type f | head -200
             exit 1
           fi
 
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Android project: $PROJECT_DIR"
+          echo "Android project found at: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Install Gradle 8.9
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLE_VERSION="8.9"
+          GRADLE_HOME="$RUNNER_TEMP/gradle-$GRADLE_VERSION"
+
+          if [ ! -x "$GRADLE_HOME/bin/gradle" ]; then
+            curl --fail --location --retry 3 \
+              "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
+              --output "$RUNNER_TEMP/gradle.zip"
+
+            unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          fi
+
+          echo "$GRADLE_HOME/bin" >> "$GITHUB_PATH"
+          "$GRADLE_HOME/bin/gradle" --version
 
       - name: Build debug APK
         shell: bash
@@ -91,18 +110,9 @@ jobs:
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          if [ ! -f "gradlew" ]; then
-            echo "::error::Thiếu Gradle Wrapper (gradlew)."
-            exit 1
-          fi
+          gradle --no-daemon --stacktrace clean assembleDebug
 
-          chmod +x gradlew
-
-          # Kiểm tra cấu hình trước khi build.
-          ./gradlew --version
-          ./gradlew --no-daemon clean assembleDebug
-
-      - name: Find generated APK
+      - name: Verify APK
         id: apk
         shell: bash
         env:
@@ -110,23 +120,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          APK_PATH="$(find "$PROJECT_DIR" -type f \
-            -path '*/build/outputs/apk/debug/*.apk' \
-            -not -name '*unaligned*' | head -n 1)"
+          APK_PATH="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::Build không tạo ra APK debug."
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::Không có APK tại đường dẫn mong đợi: $APK_PATH"
+            echo "Các APK tìm thấy:"
+            find "$PROJECT_DIR" -type f -name '*.apk' -print || true
             exit 1
           fi
 
           echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
-          echo "APK generated: $APK_PATH"
           ls -lh "$APK_PATH"
+          file "$APK_PATH"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Vung-Facebook-AI-Auto-debug
+          name: Vung-Facebook-AI-Auto-debug-APK
           path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
           retention-days: 14
