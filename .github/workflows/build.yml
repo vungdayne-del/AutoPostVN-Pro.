@@ -2,9 +2,9 @@
 name: Build Vung Facebook AI Auto APK
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -37,23 +37,21 @@ jobs:
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
           if [ ! -d "$SDK" ]; then
-            echo "::error::Không tìm thấy Android SDK tại $SDK"
+            echo "::error::Android SDK not found: $SDK"
             exit 1
           fi
 
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
 
           SDKMANAGER="$(find "$SDK/cmdline-tools" \
-            -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)"
+            -type f -name sdkmanager 2>/dev/null \
+            | sort -V | tail -n 1 || true)"
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "::error::Không tìm thấy sdkmanager trong Android SDK."
+            echo "::error::sdkmanager not found"
             exit 1
           fi
-
-          echo "Using SDK manager: $SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
 
@@ -62,59 +60,60 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-          test -d "$SDK/platforms/android-35"
-          test -d "$SDK/build-tools/35.0.0"
-
-      - name: Extract and locate Android project
+      - name: Extract Android project
         id: project
         shell: bash
         run: |
           set -euo pipefail
 
-          SOURCE="$RUNNER_TEMP/vung-source"
-          mkdir -p "$SOURCE"
+          ROOT="$RUNNER_TEMP/vung-source"
+          mkdir -p "$ROOT"
 
-          ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
-            -maxdepth 4 -type f \
-            -iname 'Vung-Facebook-AI-Auto-v2.zip' \
+          ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 4 \
+            -type f -iname 'Vung-Facebook-AI-Auto-v2.zip' \
             -not -path '*/.git/*' | head -n 1 || true)"
 
-          if [ -n "$ZIP_FILE" ]; then
-            echo "Extracting $ZIP_FILE"
-            unzip -q "$ZIP_FILE" -d "$SOURCE"
-            SEARCH_ROOT="$SOURCE"
+          if [ -n "$ZIP" ]; then
+            echo "Using archive: $ZIP"
+            unzip -q "$ZIP" -d "$ROOT"
+            SEARCH="$ROOT"
           else
-            echo "ZIP not found; checking repository source."
-            SEARCH_ROOT="$GITHUB_WORKSPACE"
+            echo "No source archive; checking repository."
+            SEARCH="$GITHUB_WORKSPACE"
           fi
 
-          SETTINGS="$(find "$SEARCH_ROOT" \
-            -type f \
+          SETTINGS="$(find "$SEARCH" -type f \
             \( -name settings.gradle.kts \
                -o -name settings.gradle \) \
-            -not -path '*/.gradle/*' \
-            | head -n 1 || true)"
+            -not -path '*/.gradle/*' | head -n 1 || true)"
 
           if [ -z "$SETTINGS" ]; then
-            echo "::error::Không tìm thấy settings.gradle(.kts)."
-            find "$SEARCH_ROOT" -maxdepth 5 -type f | head -200
+            echo "::error::No Gradle settings file found."
+            find "$SEARCH" -maxdepth 5 -type f | head -200
             exit 1
           fi
 
-          PROJECT="$(dirname "$SETTINGS")"
+          DIR="$(dirname "$SETTINGS")"
 
-          if [ ! -f "$PROJECT/app/build.gradle.kts" ] && \
-             [ ! -f "$PROJECT/app/build.gradle" ]; then
-            echo "::error::Không tìm thấy cấu hình module app."
-            find "$PROJECT" -maxdepth 4 -type f | head -200
+          if [ ! -f "$DIR/app/build.gradle.kts" ] && \
+             [ ! -f "$DIR/app/build.gradle" ]; then
+            echo "::error::Android app module not found: $DIR"
+            find "$DIR" -maxdepth 4 -type f | head -200
             exit 1
           fi
 
-          echo "project_dir=$PROJECT" >> "$GITHUB_OUTPUT"
-          echo "Project directory: $PROJECT"
-          ls -la "$PROJECT"
+          echo "project_dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Project directory: $DIR"
+          echo "Gradle settings:"
+          cat "$SETTINGS"
 
-      - name: Install Gradle 8.9
+          echo "Android build configuration:"
+          find "$DIR" -maxdepth 3 -type f \
+            \( -name 'build.gradle' -o -name 'build.gradle.kts' \
+               -o -name 'gradle.properties' \
+               -o -name 'libs.versions.toml' \) -print
+
+      - name: Install Gradle
         shell: bash
         run: |
           set -euo pipefail
@@ -122,29 +121,61 @@ jobs:
           VERSION="8.9"
           DEST="$RUNNER_TEMP/gradle-$VERSION"
 
-          if [ ! -x "$DEST/bin/gradle" ]; then
-            curl --fail --location --retry 3 \
-              "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
-              -o "$RUNNER_TEMP/gradle.zip"
+          curl --fail --location --retry 3 \
+            "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+            -o "$RUNNER_TEMP/gradle.zip"
 
-            unzip -q "$RUNNER_TEMP/gradle.zip" \
-              -d "$RUNNER_TEMP"
-          fi
+          unzip -q -o "$RUNNER_TEMP/gradle.zip" \
+            -d "$RUNNER_TEMP"
 
           echo "$DEST/bin" >> "$GITHUB_PATH"
           "$DEST/bin/gradle" --version
 
-      - name: Build debug APK
+      - name: Build APK and capture errors
+        id: build
+        continue-on-error: true
         shell: bash
         env:
           PROJECT_DIR: ${{ steps.project.outputs.project_dir }}
         run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
+          set -uo pipefail
 
-          gradle --no-daemon --stacktrace clean assembleDebug
+          cd "$PROJECT_DIR"
+          LOG="$RUNNER_TEMP/android-build.log"
+
+          echo "===== Java =====" | tee "$LOG"
+          java -version 2>&1 | tee -a "$LOG"
+
+          echo "===== Android SDK =====" | tee -a "$LOG"
+          echo "$ANDROID_HOME" | tee -a "$LOG"
+
+          echo "===== Gradle build =====" | tee -a "$LOG"
+
+          gradle --no-daemon --console=plain \
+            --stacktrace clean assembleDebug \
+            2>&1 | tee -a "$LOG"
+
+          RESULT=${PIPESTATUS[0]}
+          echo "exit_code=$RESULT" >> "$GITHUB_OUTPUT"
+
+          echo "===== Error summary ====="
+          grep -n -E \
+            'What went wrong:|Execution failed for task|Could not resolve|Could not find|^e: | error:|SDK location not found|Unsupported class file|Minimum supported Gradle version' \
+            "$LOG" | head -100 || true
+
+          exit "$RESULT"
+
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-diagnostic-log
+          path: ${{ runner.temp }}/android-build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Verify APK
+        if: steps.build.outcome == 'success'
         id: apk
         shell: bash
         env:
@@ -155,7 +186,7 @@ jobs:
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -s "$APK" ]; then
-            echo "::error::Không tìm thấy APK sau khi build."
+            echo "::error::Build succeeded but APK is missing: $APK"
             find "$PROJECT_DIR" -type f -name '*.apk' -print || true
             exit 1
           fi
@@ -165,9 +196,16 @@ jobs:
           sha256sum "$APK"
 
       - name: Upload APK
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: Vung-Facebook-AI-Auto-debug-APK
           path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
           retention-days: 14
+
+      - name: Fail if build failed
+        if: steps.build.outcome != 'success'
+        run: |
+          echo "::error::Gradle build failed. Download android-build-diagnostic-log from Artifacts."
+          exit 1
